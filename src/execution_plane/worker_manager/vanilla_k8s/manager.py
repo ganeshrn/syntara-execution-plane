@@ -15,11 +15,15 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from execution_plane.container_protocol.workload import ContainerWorkload
 from execution_plane.models.execution_target_placement import KubernetesPlacement
 from execution_plane.models.work_item import WorkItemStatus
+from execution_plane.node_protocol.workload import NodeWorkload
 from execution_plane.worker_manager.vanilla_k8s.transport import TransportError, run_job
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from execution_plane.cluster.cluster_service import ClusterService
     from execution_plane.config import EPSettings
     from execution_plane.execution_target.execution_target_service import ExecutionTargetService
@@ -27,25 +31,47 @@ if TYPE_CHECKING:
     from execution_plane.models.execution_target import ExecutionTarget
     from execution_plane.models.work_item import WorkItem
     from execution_plane.work_item.work_item_service import WorkItemService
+    from execution_plane.worker_manager.vanilla_k8s.workload_protocol import WorkloadProtocol
 
 logger = structlog.stdlib.get_logger(__name__)
 
 MAX_STATUS_CODE = 255
+_SCRIPT_PAYLOAD_INVALID = "Script work item payload is invalid"
+_SCRIPT_OUTPUT_CONFIG_INVALID = "Script work item output configuration is invalid"
+_CONTAINER_PAYLOAD_INVALID = "Container work item payload is invalid"
+_WORKLOAD_TYPE_UNSUPPORTED = "Work item has an unsupported workload type"
+_CONTAINER_FAILURE_INVALID = "Container workload returned an invalid failure"
+_CONTAINER_ACTION_FAILED = "The plugin step did not complete."
+_CONTAINER_RESPONSE_INVALID = "Container workload returned an invalid response"
+_CONTAINER_RESULT_INVALID = "Container workload returned an invalid result"
+_CONTAINER_OUTPUT_INVALID = "Container workload returned non-object output"
 
 
 class RetryableDispatchError(Exception):
     """Transient transport/capacity failure — requeue the work item, do not fail it."""
 
 
-class NodeExecutionError(Exception):
-    """The node ran and returned a non-zero result — terminal for the activity."""
+class WorkloadExecutionError(Exception):
+    """A workload ran and returned a terminal failure."""
 
-    def __init__(self, message: str, *, error_type: str, output: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str,
+        output: dict[str, Any] | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         """Carry the safe error classification and any partial output."""
         super().__init__(message)
         self.error_type = error_type
         self.output = output
+        self.details = details or {}
         self.persisted = False
+
+
+class NodeExecutionError(WorkloadExecutionError):
+    """Compatibility name for legacy script-node terminal failures."""
 
 
 class WorkItemPayloadError(Exception):
@@ -80,12 +106,12 @@ class VanillaK8sWorkerManager:
         self._work_service = work_service
         self._settings = settings
 
-    async def dispatch(self, work_item: WorkItem) -> dict[str, Any]:  # noqa: C901, PLR0912, PLR0915
+    async def dispatch(self, work_item: WorkItem) -> dict[str, Any]:  # noqa: C901, PLR0915
         """Allocate the worker, stream its result, and persist the WorkItem outcome.
 
         Returns ``{"output": ...}`` on success. Raises:
         - ``RetryableDispatchError`` when the worker could not run (requeue with backoff),
-        - ``NodeExecutionError`` when the node ran but failed (fail the activity),
+        - ``WorkloadExecutionError`` when the workload ran but failed (fail the activity),
         - ``WorkItemPayloadError`` when the payload is malformed (fail the activity).
         """
         if work_item.execution_target_id is None:
@@ -98,15 +124,7 @@ class VanillaK8sWorkerManager:
             raise RetryableDispatchError(message)
 
         payload = work_item.payload or {}
-        invocation = payload.get("invocation")
-        image = payload.get("image")
-        if not isinstance(invocation, dict) or not isinstance(image, str) or not image:
-            message = "Work item payload is missing 'invocation' or 'image'"
-            raise WorkItemPayloadError(message)
-        output_config: dict[str, str] | None = payload.get("output_config")
-        if output_config is not None and not isinstance(output_config, dict):
-            message = "Work item payload has an invalid 'output_config'"
-            raise WorkItemPayloadError(message)
+        image, workload, result_mapper = _load_workload(payload)
         cluster = await self._cluster_service.get(target.cluster_id, include_secret=True)
         if cluster is None or not cluster.enabled:
             message = "Assigned cluster is unavailable"
@@ -120,9 +138,9 @@ class VanillaK8sWorkerManager:
 
         async def persist_result(frame: dict[str, Any]) -> None:
             try:
-                result = _map_result(frame, output_config)
+                result = result_mapper(frame)
                 status = WorkItemStatus.COMPLETED
-            except NodeExecutionError as exc:
+            except WorkloadExecutionError as exc:
                 if cancelled.is_set() and exc.error_type == "CancelledError":
                     result = {"cancelled": True, "execution_started": True, "reason": str(exc)}
                     if exc.output is not None:
@@ -132,6 +150,7 @@ class VanillaK8sWorkerManager:
                     result = {"error": str(exc), "error_type": exc.error_type}
                     if exc.output is not None:
                         result["output"] = exc.output
+                    result.update(exc.details)
                     status = WorkItemStatus.FAILED
             await self._work_service.set_result(
                 work_item.id,
@@ -147,7 +166,7 @@ class VanillaK8sWorkerManager:
                 future.result(timeout=30)
             except Exception:  # noqa: BLE001 - never lose a terminal result to a logging or callback error
                 future.cancel()
-                message = "Could not durably store node result"
+                message = "Could not durably store workload result"
                 raise TransportError(message, submitted=True) from None
 
         def record_resource_state(name: str, uid: str | None, status: str, error: str | None) -> None:
@@ -177,7 +196,7 @@ class VanillaK8sWorkerManager:
                 )
 
         def on_progress(frame: dict[str, Any]) -> None:
-            logger.debug("node progress", work_item_id=identity, node_event=frame.get("event"))
+            logger.debug("workload progress", work_item_id=identity, workload_event=frame.get("event"))
 
         try:
             transport_task = asyncio.create_task(
@@ -185,7 +204,7 @@ class VanillaK8sWorkerManager:
                     run_job,
                     target=target_config,
                     image=image,
-                    invocation=invocation,
+                    workload=workload,
                     identity=identity,
                     attempt_id=attempt_id,
                     startup=self._settings.node_startup_seconds,
@@ -218,11 +237,11 @@ class VanillaK8sWorkerManager:
                 raise WorkloadCancelledError from None
             if exc.submitted:
                 raise WorkloadOutcomeUnknownError(str(exc)) from None
-            raise NodeExecutionError(str(exc), error_type="NodeTransportError") from None
+            raise WorkloadExecutionError(str(exc), error_type="WorkloadTransportError") from None
 
         try:
-            return _map_result(frame, output_config)
-        except NodeExecutionError as exc:
+            return result_mapper(frame)
+        except WorkloadExecutionError as exc:
             exc.persisted = True
             raise
 
@@ -277,6 +296,59 @@ def _map_result(frame: dict[str, Any], output_config: dict[str, str] | None) -> 
         message = result.get("ErrorMessage") or result.get("StatusMessage") or "Node execution failed"
         raise NodeExecutionError(message, error_type=failure.get("type") or "NodeExecutionError", output=output)
     return {"output": output}
+
+
+def _load_workload(
+    payload: dict[str, Any],
+) -> tuple[str, WorkloadProtocol, Callable[[dict[str, Any]], dict[str, Any]]]:
+    """Choose the legacy script or published SDK container workload adapter."""
+    workload_type = payload.get("workload_type")
+    if workload_type == "script":
+        invocation = payload.get("invocation")
+        image = payload.get("image")
+        output_config = payload.get("output_config")
+        if not isinstance(invocation, dict) or not isinstance(image, str) or not image:
+            raise WorkItemPayloadError(_SCRIPT_PAYLOAD_INVALID)
+        if output_config is not None and not isinstance(output_config, dict):
+            raise WorkItemPayloadError(_SCRIPT_OUTPUT_CONFIG_INVALID)
+        return image, NodeWorkload(invocation), lambda frame: _map_result(frame, output_config)
+    if workload_type == "container":
+        try:
+            workload = ContainerWorkload.from_request(payload.get("container_request"))
+        except (TypeError, ValueError) as error:
+            raise WorkItemPayloadError(_CONTAINER_PAYLOAD_INVALID) from error
+        return workload.image, workload, _map_container_result
+    raise WorkItemPayloadError(_WORKLOAD_TYPE_UNSUPPORTED)
+
+
+def _map_container_result(frame: dict[str, Any]) -> dict[str, Any]:
+    """Map the shared container ABI's result/failure envelope to EP state."""
+    if frame.get("kind") == "failure":
+        code = frame.get("code")
+        retryable = frame.get("retryable")
+        outcome = frame.get("outcome")
+        if not isinstance(code, str) or not isinstance(retryable, bool) or not isinstance(outcome, str):
+            raise WorkloadExecutionError(_CONTAINER_FAILURE_INVALID, error_type="ContainerProtocolError")
+        raise WorkloadExecutionError(
+            _CONTAINER_ACTION_FAILED,
+            error_type="ContainerWorkloadFailure",
+            details={"failure_code": code, "retryable": retryable, "outcome": outcome},
+        )
+    if frame.get("kind") != "result":
+        raise WorkloadExecutionError(_CONTAINER_RESPONSE_INVALID, error_type="ContainerProtocolError")
+    digest = frame.get("outputSchemaDigest")
+    output = frame.get("output")
+    object_reference = frame.get("objectReference")
+    if not isinstance(digest, str) or (output is None) == (object_reference is None):
+        raise WorkloadExecutionError(_CONTAINER_RESULT_INVALID, error_type="ContainerProtocolError")
+    result: dict[str, Any] = {"output_schema_digest": digest}
+    if output is not None:
+        if not isinstance(output, dict):
+            raise WorkloadExecutionError(_CONTAINER_OUTPUT_INVALID, error_type="ContainerProtocolError")
+        result["output"] = output
+    else:
+        result["object_reference"] = object_reference
+    return result
 
 
 def _select_output(raw: dict[str, Any], output_config: dict[str, str] | None) -> dict[str, Any]:

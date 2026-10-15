@@ -6,17 +6,13 @@ from execution_plane.worker_manager.vanilla_k8s.manager import NodeExecutionErro
 from execution_plane.worker_manager.vanilla_k8s.transport import job_body, network_policy_body
 
 
-def _invocation() -> dict[str, object]:
-    return {"timeout_seconds": 60}
-
-
 def test_job_body_is_a_single_attempt_worker_allocation() -> None:
     job = job_body(
         "syntara-node-attempt",
         "work-item-id",
         "work-item-id-2",
         "registry.example/node@sha256:abc",
-        _invocation(),
+        60,
         startup=90,
         grace=15,
     )

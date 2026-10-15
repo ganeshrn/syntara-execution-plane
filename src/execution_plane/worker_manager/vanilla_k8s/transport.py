@@ -18,17 +18,19 @@ from kubernetes import client
 from kubernetes.client.exceptions import ApiException
 from kubernetes.stream import portforward
 
-from execution_plane.node_protocol.client import NodeRpcError, invoke
-from execution_plane.node_protocol.codec import CHANNEL_OPTIONS, MAX_MESSAGE_BYTES, PORT, encode_request
 from execution_plane.worker_manager.vanilla_k8s.forward import forward_socket
+from execution_plane.worker_manager.vanilla_k8s.workload_protocol import (
+    CHANNEL_OPTIONS,
+    GRPC_PORT,
+    WorkloadProtocol,
+    WorkloadProtocolError,
+)
 
 if TYPE_CHECKING:
     import threading
     from collections.abc import Callable
 
 logger = structlog.stdlib.get_logger(__name__)
-
-MAX_FRAME_BYTES = MAX_MESSAGE_BYTES
 
 
 def _network_contains(
@@ -82,7 +84,7 @@ def pod_body(
     identity: str,
     attempt_id: str,
     image: str,
-    invocation: dict[str, Any],
+    timeout_seconds: int,
     *,
     startup: int,
     grace: int,
@@ -107,7 +109,7 @@ def pod_body(
         "spec": {
             "restartPolicy": "Never",
             "automountServiceAccountToken": False,
-            "activeDeadlineSeconds": startup + invocation["timeout_seconds"] + grace,
+            "activeDeadlineSeconds": startup + timeout_seconds + grace,
             "terminationGracePeriodSeconds": grace,
             "nodeSelector": _node_selector(node_selectors or []),
             "tolerations": _tolerations(tolerations or []),
@@ -117,7 +119,7 @@ def pod_body(
                 {
                     "name": "node",
                     "image": image,
-                    "ports": [{"name": "grpc", "containerPort": PORT}],
+                    "ports": [{"name": "grpc", "containerPort": GRPC_PORT}],
                     "volumeMounts": mounts,
                     "resources": {
                         "requests": {"cpu": "100m", "memory": "128Mi"},
@@ -246,7 +248,7 @@ def job_body(
     identity: str,
     attempt_id: str,
     image: str,
-    invocation: dict[str, Any],
+    timeout_seconds: int,
     *,
     startup: int,
     grace: int,
@@ -259,7 +261,7 @@ def job_body(
         identity,
         attempt_id,
         image,
-        invocation,
+        timeout_seconds,
         startup=startup,
         grace=grace,
         node_selectors=node_selectors,
@@ -281,7 +283,7 @@ def job_body(
             "completions": 1,
             "parallelism": 1,
             "backoffLimit": 0,
-            "activeDeadlineSeconds": startup + invocation["timeout_seconds"] + grace,
+            "activeDeadlineSeconds": startup + timeout_seconds + grace,
             "ttlSecondsAfterFinished": 3600,
             "template": pod,
         },
@@ -292,7 +294,7 @@ def run_job(  # noqa: C901, PLR0912, PLR0915 - one owned cold-start allocation
     *,
     target: dict[str, Any],
     image: str,
-    invocation: dict[str, Any],
+    workload: WorkloadProtocol,
     identity: str,
     attempt_id: str,
     startup: int,
@@ -306,13 +308,13 @@ def run_job(  # noqa: C901, PLR0912, PLR0915 - one owned cold-start allocation
     allowed_egress_cidrs: list[str] | None = None,
     forbidden_egress_cidrs: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Execute once in a cold-start Job; application data travels only over gRPC."""
+    """Execute one ABI-neutral workload; application data travels only over gRPC."""
     name = "syntara-node-" + hashlib.sha256(attempt_id.encode()).hexdigest()[:32]
     namespace = target["namespace"]
-    request = encode_request(invocation, attempt_id)
-    if request.ByteSize() > MAX_FRAME_BYTES:
-        message = "Node invocation exceeds transport limit"
-        raise TransportError(message)
+    try:
+        workload.validate_transport()
+    except WorkloadProtocolError as error:
+        raise TransportError(str(error), retryable=error.retryable) from error
     with tempfile.TemporaryDirectory(prefix="syntara-node-") as directory:
         config = client.Configuration()
         config.host = target["base_url"]
@@ -393,7 +395,7 @@ def run_job(  # noqa: C901, PLR0912, PLR0915 - one owned cold-start allocation
                             identity,
                             attempt_id,
                             image,
-                            invocation,
+                            workload.timeout_seconds,
                             startup=startup,
                             grace=grace,
                             node_selectors=node_selectors,
@@ -481,12 +483,12 @@ def run_job(  # noqa: C901, PLR0912, PLR0915 - one owned cold-start allocation
                         api.connect_get_namespaced_pod_portforward,
                         pod_name,
                         namespace,
-                        ports=str(PORT),
+                        ports=str(GRPC_PORT),
                         _request_timeout=15,
                     )
                     try:
                         with (
-                            forward_socket(connection.socket(PORT)) as address,
+                            forward_socket(connection.socket(GRPC_PORT)) as address,
                             grpc.insecure_channel(address, options=CHANNEL_OPTIONS) as channel,
                         ):
 
@@ -494,19 +496,18 @@ def run_job(  # noqa: C901, PLR0912, PLR0915 - one owned cold-start allocation
                                 nonlocal submitted
                                 submitted = True
 
-                            frame = invoke(
+                            frame = workload.invoke(
                                 channel,
-                                invocation,
-                                identity=attempt_id,
+                                attempt_id=attempt_id,
                                 progress=progress,
                                 cancelled=cancelled,
-                                startup=min(2, max(0.1, grpc_deadline - time.monotonic())),
-                                grace=grace,
+                                startup_seconds=min(2, max(0.1, grpc_deadline - time.monotonic())),
+                                grace_seconds=grace,
                                 on_execute_submitted=mark_submitted,
                             )
                             on_result(frame)
                             return frame
-                    except NodeRpcError as exc:
+                    except WorkloadProtocolError as exc:
                         # Running can precede the listener. A refused kubelet
                         # connection needs a new port-forward, before Execute only.
                         if not exc.retryable or time.monotonic() >= grpc_deadline:
@@ -517,7 +518,7 @@ def run_job(  # noqa: C901, PLR0912, PLR0915 - one owned cold-start allocation
                         with suppress(Exception):
                             connection.close()
                         connection = None
-            except NodeRpcError as exc:
+            except WorkloadProtocolError as exc:
                 pending_transport_error = TransportError(
                     str(exc),
                     retryable=exc.retryable,
