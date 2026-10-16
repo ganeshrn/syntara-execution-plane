@@ -10,9 +10,9 @@ import grpc
 import pytest
 from syntara_plugin.contracts import container_workload_request_digest
 from syntara_plugin.runtime import (
-    ActionRegistry,
     ContainerInvocation,
     ContainerResult,
+    StepRegistry,
     add_container_runtime_service,
 )
 
@@ -86,7 +86,7 @@ def test_container_workload_executes_through_the_published_runtime_abi() -> None
         return ContainerResult(_OUTPUT_DIGEST, output={"issue": 42})
 
     server = grpc.server(ThreadPoolExecutor(max_workers=2))
-    add_container_runtime_service(server, ActionRegistry({"github.create-issue.v1": create_issue}))
+    add_container_runtime_service(server, StepRegistry({"github.create-issue.v1": create_issue}))
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()
     channel = grpc.insecure_channel(f"127.0.0.1:{port}")
