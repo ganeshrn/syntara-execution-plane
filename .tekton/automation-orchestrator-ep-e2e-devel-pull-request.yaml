@@ -85,6 +85,12 @@ spec:
           Branch, tag, or SHA of automation-orchestrator-operator to build
           from source via aap-dev. Independent of this Execution Plane PR.
         default: AAP-90779-ep-from-source
+      - name: ao-operator-github-app-secret
+        type: string
+        description: >
+          GitHub App secret for cloning automation-nexus repos. Distinct from
+          ao-github-app-secret (syntara-orchestration installation).
+        default: orchestrator-ci-for-konflux-gh-app-nexus-org
       - name: ao-revision
         type: string
         description: >
@@ -336,8 +342,8 @@ spec:
         params:
           - name: ssh-credentials-secret
             value: ssh-credentials-$(context.pipelineRun.name)
-          - name: ao-github-app-secret
-            value: $(params.ao-github-app-secret)
+          - name: ao-operator-github-app-secret
+            value: $(params.ao-operator-github-app-secret)
           - name: ao-operator-github-org
             value: $(params.ao-operator-github-org)
           - name: ao-operator-github-repo
@@ -350,11 +356,12 @@ spec:
             $HOME/automation-orchestrator-operator on the Kind VM. aap-dev
             AAP-90779-ep-from-source builds the manager from that checkout
             because deploy-ao-using-aap-dev cannot clone the private operator
-            repo or keep it in src/sources.yaml.
+            repo or keep it in src/sources.yaml. Uses the automation-nexus
+            GitHub App installation (not the syntara-orchestration one).
           params:
             - name: ssh-credentials-secret
               type: string
-            - name: ao-github-app-secret
+            - name: ao-operator-github-app-secret
               type: string
             - name: ao-operator-github-org
               type: string
@@ -368,7 +375,7 @@ spec:
                 secretName: $(params.ssh-credentials-secret)
             - name: nexus-github-app-volume
               secret:
-                secretName: $(params.ao-github-app-secret)
+                secretName: $(params.ao-operator-github-app-secret)
           steps:
             - name: stage
               image: quay.io/aap-ci/tekton-catalog/task-runner/ansible:0.1@sha256:6625997cac261e12aa0437ff2b0b0aa0275a4fa8ff3f833c21f8f029880d5c88
