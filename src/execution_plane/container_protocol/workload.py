@@ -1,4 +1,12 @@
-"""Adapt validated SDK container workload requests to the published runtime ABI."""
+"""Adapt validated SDK container workload requests to the published runtime ABI.
+
+ABI means Application Binary Interface. In this code it is the versioned,
+language-neutral gRPC protocol between the Execution Plane (the client and
+launcher) and a custom plugin workload (the server), not an OCI image's CPU or
+operating-system compatibility. The EP validates the shared request contract,
+uses ``Health`` to verify the workload's ABI and advertised step revision, and
+only then invokes ``Execute`` or ``Cancel``.
+"""
 
 from __future__ import annotations
 
